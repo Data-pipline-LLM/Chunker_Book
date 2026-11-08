@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -20,6 +21,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
+from .ops_control import authorize as authorize_ops, check_cancel, JobCancelled, watch_process, SubmissionLease, ServiceTokenMiddleware
 
 
 APP_VERSION = "0.2.0"
@@ -46,7 +48,7 @@ CHUNKER_LLM_MAX_OUTPUT_TOKENS = int(os.getenv("CHUNKER_LLM_MAX_OUTPUT_TOKENS", "
 ATOMIZER_OVERLAP_LINES = int(os.getenv("ATOMIZER_OVERLAP_LINES", "8"))
 PLANNER_OVERLAP_UNITS = int(os.getenv("PLANNER_OVERLAP_UNITS", "4"))
 
-TERMINAL = {"completed", "failed"}
+TERMINAL = {"completed", "failed", "cancelled"}
 EXECUTOR = ThreadPoolExecutor(max_workers=JOB_WORKERS, thread_name_prefix="chunker-job")
 STATUS_LOCK = threading.Lock()
 
@@ -60,6 +62,7 @@ app = FastAPI(
         "Designed as a job API so a UI can show readable progress and errors."
     ),
 )
+app.add_middleware(ServiceTokenMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -380,13 +383,20 @@ def run_chunker(job_id: str, input_folder: Path, output_root: Path) -> Path:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            start_new_session=True,
         )
+        stop_watch = threading.Event()
+        watcher = threading.Thread(target=watch_process, args=(proc, p['root'], stop_watch), daemon=True)
+        watcher.start()
         assert proc.stdout is not None
         for line in proc.stdout:
             logf.write(line)
             logf.flush()
             user_friendly_chunker_progress(job_id, line, progress_memory)
         rc = proc.wait()
+        stop_watch.set()
+        watcher.join(timeout=1)
+        check_cancel(p['root'])
 
     if rc != 0:
         manifest = output_root / "run_manifest.json"
@@ -420,6 +430,7 @@ def count_jsonl(path: Path) -> int:
 def run_job(job_id: str) -> None:
     p = paths_for(job_id)
     try:
+        check_cancel(p['root'])
         write_status(job_id, status="processing", started_at=utc_now(), error=None)
 
         input_type = read_status(job_id).get("input_type", "pdf")
@@ -429,11 +440,14 @@ def run_job(job_id: str) -> None:
             set_stage(job_id, "ocr_skipped", 30, "OCR skipped: supplied OCR JSON")
             emit_event(job_id, level="info", stage="ocr_skipped", progress=30,
                        message="OCR API was not called; using supplied OCR JSON")
+        elif read_status(job_id).get('controlled') and p['ocr_raw'].exists():
+            raw = read_json(p['ocr_raw'])
         else:
             set_stage(job_id, "ocr", 5, "Sending PDF to OCR service")
             raw = call_ocr(job_id, p["source"])
             pages = raw.get("pages") if isinstance(raw.get("pages"), list) else []
             set_stage(job_id, "ocr", 30, f"OCR completed ({len(pages)} pages)")
+        check_cancel(p['root'])
         p["ocr_raw"].parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(p["ocr_raw"], raw)
 
@@ -443,7 +457,15 @@ def run_job(job_id: str) -> None:
         atomic_write_json(p["ocr_normalized"], normalized)
 
         set_stage(job_id, "chunking", 38, "Starting Full-LLM semantic chunker")
-        chunks_path = run_chunker(job_id, p["ocr_book"], p["chunker_root"])
+        checkpoint = p['root'] / 'chunker_done.json'
+        if read_status(job_id).get('controlled') and checkpoint.exists():
+            chunks_path = p['root'] / read_json(checkpoint)['path']
+            if p['root'].resolve() not in chunks_path.resolve().parents:
+                raise RuntimeError('invalid chunk checkpoint')
+        else:
+            chunks_path = run_chunker(job_id, p["ocr_book"], p["chunker_root"])
+            atomic_write_json(checkpoint, {'path': str(chunks_path.relative_to(p['root']))})
+        check_cancel(p['root'])
         chunk_count = count_jsonl(chunks_path)
 
         if chunk_count <= 0:
@@ -475,6 +497,9 @@ def run_job(job_id: str) -> None:
             progress=100,
             message=f"Completed successfully ({chunk_count} chunks)",
         )
+    except JobCancelled:
+        write_status(job_id, status='cancelled', stage='cancelled', message='Cancellation acknowledged', completed_at=utc_now())
+        emit_event(job_id, level='info', stage='cancelled', message='Cancellation acknowledged')
     except Exception as exc:
         status = read_status(job_id)
         stage = str(status.get("stage") or "unknown")
@@ -515,8 +540,12 @@ def startup_reconcile() -> None:
     for status_path in DATA_ROOT.glob("*/status.json"):
         try:
             status = read_json(status_path)
-            if status.get("status") in {"queued", "processing"}:
+            if status.get("status") in {"queued", "processing", "cancel_requested"}:
                 jid = str(status.get("job_id") or status_path.parent.name)
+                if status.get('controlled') and ((status_path.parent / 'chunker_done.json').exists()
+                        or (status_path.parent / 'cancel.requested').exists()):
+                    EXECUTOR.submit(run_job, jid)
+                    continue
                 fail_job(
                     jid,
                     str(status.get("stage") or "server"),
@@ -555,8 +584,7 @@ def ready(input_type: str = "pdf") -> Dict[str, Any]:
     return {"status": "ready", "input_type": input_type, "checks": checks}
 
 
-@app.post("/v1/jobs", response_model=JobAccepted, status_code=202)
-async def create_job(
+async def _create_job(
     request: Request,
     pdf_file: Optional[UploadFile] = File(None),
     ocr_file: Optional[UploadFile] = File(None),
@@ -575,12 +603,13 @@ async def create_job(
         raise HTTPException(status_code=415, detail="ocr_file must be .json")
     input_type = "ocr_json" if extension == ".json" else "pdf"
 
-    jid = str(uuid.uuid4())
+    jid = request.scope.get('ops_job_id') or str(uuid.uuid4())
     p = paths_for(jid)
     dest = p["ocr_input"] if input_type == "ocr_json" else p["source"]
     dest.parent.mkdir(parents=True, exist_ok=True)
     max_bytes = MAX_UPLOAD_MB * 1024 * 1024
     size = 0
+    digest = hashlib.sha256()
     try:
         with dest.open("wb") as out:
             while True:
@@ -591,6 +620,9 @@ async def create_job(
                 if size > max_bytes:
                     raise HTTPException(status_code=413, detail=f"File exceeds {MAX_UPLOAD_MB} MB limit")
                 out.write(chunk)
+                digest.update(chunk)
+        if request.scope.get('ops_job_id') and digest.hexdigest() != request.headers.get('X-Input-SHA256'):
+            raise HTTPException(409, 'input checksum mismatch')
         if input_type == "pdf":
             with dest.open("rb") as f:
                 if f.read(5) != b"%PDF-":
@@ -604,13 +636,18 @@ async def create_job(
             except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
                 raise HTTPException(status_code=400, detail=f"Invalid OCR JSON: {exc}") from exc
     except Exception:
-        shutil.rmtree(p["root"], ignore_errors=True)
+        if request.scope.get('ops_job_id'):
+            dest.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(p["root"], ignore_errors=True)
         raise
     finally:
         await upload.close()
 
     base = str(request.base_url).rstrip("/")
     initial = {
+        'controlled': bool(request.scope.get('ops_job_id')),
+        'input_sha256': request.headers.get('X-Input-SHA256', ''),
         "job_id": jid,
         "filename": name,
         "size_bytes": size,
@@ -634,6 +671,44 @@ async def create_job(
         status_url=f"{base}/v1/jobs/{jid}",
         events_url=f"{base}/v1/jobs/{jid}/events",
     )
+
+
+@app.post('/v1/jobs', response_model=JobAccepted, status_code=202)
+async def create_job(request: Request, pdf_file: Optional[UploadFile] = File(None),
+                     ocr_file: Optional[UploadFile] = File(None), input_file: Optional[UploadFile] = File(None)):
+    operation = request.headers.get('X-Operation-ID')
+    if not operation:
+        return await _create_job(request, pdf_file, ocr_file, input_file)
+    authorize_ops(request)
+    if len(operation) > 128:
+        raise HTTPException(422, 'invalid operation id')
+    jid = str(uuid.uuid5(uuid.NAMESPACE_URL, operation))
+    root = job_dir(jid)
+    with SubmissionLease(root):
+        if (root / 'cancel.requested').exists():
+            raise HTTPException(409, 'submission cancelled')
+        if paths_for(jid)['status'].exists():
+            status = read_status(jid)
+            if status.get('input_sha256') != request.headers.get('X-Input-SHA256', ''):
+                raise HTTPException(409, 'operation input differs')
+            base = str(request.base_url).rstrip('/')
+            return JobAccepted(job_id=jid, status=status['status'], status_url=f'{base}/v1/jobs/{jid}', events_url=f'{base}/v1/jobs/{jid}/events')
+        request.scope['ops_job_id'] = jid
+        return await _create_job(request, pdf_file, ocr_file, input_file)
+
+
+@app.post('/v1/jobs/{job_id}/cancel')
+def cancel_job(job_id: str, request: Request):
+    authorize_ops(request)
+    root = job_dir(job_id)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / 'cancel.requested').touch()
+    if not paths_for(job_id)['status'].exists():
+        return {'job_id': job_id, 'status': 'cancelled'}
+    status = read_status(job_id)
+    if status['status'] not in TERMINAL:
+        status = write_status(job_id, status='cancel_requested', message='Waiting for the active stage to exit')
+    return status
 
 
 @app.get("/v1/jobs/{job_id}")

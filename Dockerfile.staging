@@ -1,0 +1,10 @@
+FROM python:3.11.11-slim-bookworm
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 DATA_ROOT=/data/jobs CHUNKER_SCRIPT=/app/src/persian_ocr_chunker_full_llm_v14.py
+COPY requirements-api.txt requirements-observability.txt ./
+RUN pip install --no-cache-dir -r requirements-api.txt -r requirements-observability.txt
+COPY api ./api
+COPY src ./src
+RUN useradd --uid 10001 --create-home chunker && mkdir -p /data/jobs && chown -R chunker:chunker /data
+USER chunker
+CMD ["uvicorn","api.main:app","--host","0.0.0.0","--port","8080","--workers","1","--no-access-log"]
