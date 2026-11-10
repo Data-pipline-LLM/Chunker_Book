@@ -34,6 +34,8 @@ OCR_API_KEY = os.getenv("OCR_API_KEY", "")
 OCR_TIMEOUT_SECONDS = int(os.getenv("OCR_TIMEOUT_SECONDS", "7200"))
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "500"))
 JOB_WORKERS = max(1, int(os.getenv("JOB_WORKERS", "1")))
+OCR_WORKERS = max(1, min(256, int(os.getenv("OCR_WORKERS", "16"))))
+CHUNKER_WORKERS = max(1, min(256, int(os.getenv("CHUNKER_WORKERS", "16"))))
 CORS_ORIGINS = [x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",") if x.strip()]
 
 CHUNKER_LLM_URL = os.getenv("CHUNKER_LLM_URL", "")
@@ -50,6 +52,8 @@ PLANNER_OVERLAP_UNITS = int(os.getenv("PLANNER_OVERLAP_UNITS", "4"))
 
 TERMINAL = {"completed", "failed", "cancelled"}
 EXECUTOR = ThreadPoolExecutor(max_workers=JOB_WORKERS, thread_name_prefix="chunker-job")
+OCR_EXECUTOR = ThreadPoolExecutor(max_workers=OCR_WORKERS, thread_name_prefix="chunker-ocr")
+CHUNKER_EXECUTOR = ThreadPoolExecutor(max_workers=CHUNKER_WORKERS, thread_name_prefix="chunker-semantic")
 STATUS_LOCK = threading.Lock()
 
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
@@ -456,6 +460,36 @@ def run_job(job_id: str) -> None:
         p["ocr_book"].mkdir(parents=True, exist_ok=True)
         atomic_write_json(p["ocr_normalized"], normalized)
 
+        # Controlled Book2SFT execution can stop after OCR. The Temporal OCR
+        # stage then completes and releases its own capacity before the separate
+        # semantic Chunker stage is admitted. Legacy direct PDF submissions keep
+        # the original combined behavior.
+        if read_status(job_id).get("stage_mode") == "ocr-only":
+            check_cancel(p['root'])
+            pages = raw.get("pages") if isinstance(raw.get("pages"), list) else []
+            write_status(
+                job_id,
+                status="completed",
+                stage="ocr_completed",
+                progress=100,
+                message=f"OCR completed ({len(pages)} pages); ready for semantic chunking",
+                completed_at=utc_now(),
+                result={
+                    "input_type": "pdf",
+                    "ocr_skipped": False,
+                    "page_count": len(pages),
+                    "ocr_download_url": f"/v1/jobs/{job_id}/download/ocr.json",
+                },
+            )
+            emit_event(
+                job_id,
+                level="success",
+                stage="ocr_completed",
+                progress=100,
+                message=f"OCR completed ({len(pages)} pages)",
+            )
+            return
+
         set_stage(job_id, "chunking", 38, "Starting Full-LLM semantic chunker")
         checkpoint = p['root'] / 'chunker_done.json'
         if read_status(job_id).get('controlled') and checkpoint.exists():
@@ -515,6 +549,18 @@ def run_job(job_id: str) -> None:
         fail_job(job_id, stage, code, user_message, details=str(exc))
 
 
+def _submit_job(job_id: str, status: Optional[Dict[str, Any]] = None) -> None:
+    """Route controlled OCR and semantic chunking to independent worker pools."""
+    current = status or read_status(job_id)
+    if current.get('stage_mode') == 'ocr-only':
+        OCR_EXECUTOR.submit(run_job, job_id)
+    elif current.get('input_type') == 'ocr_json':
+        CHUNKER_EXECUTOR.submit(run_job, job_id)
+    else:
+        # Backward-compatible direct PDF API: retain its combined pipeline pool.
+        EXECUTOR.submit(run_job, job_id)
+
+
 def artifact_path(job_id: str, kind: str) -> Path:
     p = paths_for(job_id)
     status = read_status(job_id)
@@ -542,9 +588,17 @@ def startup_reconcile() -> None:
             status = read_json(status_path)
             if status.get("status") in {"queued", "processing", "cancel_requested"}:
                 jid = str(status.get("job_id") or status_path.parent.name)
-                if status.get('controlled') and ((status_path.parent / 'chunker_done.json').exists()
-                        or (status_path.parent / 'cancel.requested').exists()):
-                    EXECUTOR.submit(run_job, jid)
+                if status.get('status') == 'queued':
+                    _submit_job(jid, status)
+                    continue
+                recoverable = (
+                    (status.get('stage_mode') == 'ocr-only' and paths_for(jid)['ocr_raw'].exists())
+                    or (status.get('input_type') == 'ocr_json')
+                    or (status_path.parent / 'chunker_done.json').exists()
+                    or (status_path.parent / 'cancel.requested').exists()
+                )
+                if status.get('controlled') and recoverable:
+                    _submit_job(jid, status)
                     continue
                 fail_job(
                     jid,
@@ -562,6 +616,8 @@ def health() -> Dict[str, Any]:
         "status": "ok",
         "version": APP_VERSION,
         "job_workers": JOB_WORKERS,
+        "ocr_workers": OCR_WORKERS,
+        "chunker_workers": CHUNKER_WORKERS,
     }
 
 
@@ -602,6 +658,14 @@ async def _create_job(
     if ocr_file is not None and extension != ".json":
         raise HTTPException(status_code=415, detail="ocr_file must be .json")
     input_type = "ocr_json" if extension == ".json" else "pdf"
+    stage_mode = (request.headers.get("X-Chunker-Mode") or "full").strip().lower()
+    if stage_mode not in {"full", "ocr-only"}:
+        raise HTTPException(status_code=422, detail="X-Chunker-Mode must be full or ocr-only")
+    if stage_mode == "ocr-only":
+        if input_type != "pdf":
+            raise HTTPException(status_code=422, detail="ocr-only mode requires a PDF input")
+        if not request.scope.get("ops_job_id"):
+            raise HTTPException(status_code=403, detail="ocr-only mode is reserved for controlled pipeline jobs")
 
     jid = request.scope.get('ops_job_id') or str(uuid.uuid4())
     p = paths_for(jid)
@@ -647,6 +711,7 @@ async def _create_job(
     base = str(request.base_url).rstrip("/")
     initial = {
         'controlled': bool(request.scope.get('ops_job_id')),
+        'stage_mode': stage_mode,
         'input_sha256': request.headers.get('X-Input-SHA256', ''),
         "job_id": jid,
         "filename": name,
@@ -664,7 +729,7 @@ async def _create_job(
     }
     atomic_write_json(p["status"], initial)
     emit_event(jid, level="info", stage="queued", progress=0, message=initial["message"])
-    EXECUTOR.submit(run_job, jid)
+    _submit_job(jid, initial)
     return JobAccepted(
         job_id=jid,
         status="queued",
